@@ -1,0 +1,19 @@
+{
+  "name": "somnia-bot",
+  "version": "1.0.0",
+  "description": "Bot de Telegram para generar vídeos cortos con IA (Hugging Face)",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": ["telegram", "bot", "video", "ai", "huggingface"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "@huggingface/inference": "^2.7.0",
+    "dotenv": "^16.4.5"
+  }
+}

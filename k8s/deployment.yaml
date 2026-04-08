@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: somnia-bot
+  namespace: somnia
+  labels:
+    app: somnia-bot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: somnia-bot
+  template:
+    metadata:
+      labels:
+        app: somnia-bot
+    spec:
+      containers:
+        - name: bot
+          image: somnia-bot:latest
+          imagePullPolicy: Never
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+          env:
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: somnia-bot-secret
+                  key: TELEGRAM_BOT_TOKEN
+            - name: HF_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: somnia-bot-secret
+                  key: HF_API_TOKEN
+            - name: DATA_DIR
+              value: "/app/data"
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: somnia-bot-data
