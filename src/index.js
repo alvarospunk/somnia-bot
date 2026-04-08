@@ -1,222 +1,315 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { Client } from '@gradio/client';
-import { writeFile, unlink } from 'fs/promises';
+import Groq from 'groq-sdk';
+import { readFile, writeFile, mkdir } from 'fs/promises';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-// ── Config ──────────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const HF_TOKEN = process.env.HF_API_TOKEN;
-const SPACE_ID = process.env.VIDEO_SPACE || 'liuyuyuil/Wanx2.1_Text_to_Video';
-const DATA_DIR = process.env.DATA_DIR || './data';
+const GROQ_API_KEY   = process.env.GROQ_API_KEY;
+const DATA_DIR       = process.env.DATA_DIR || './data';
+const DATA_FILE      = join(DATA_DIR, 'dreams.json');
+// Timezone offset in hours (Spain: UTC+2 summer / UTC+1 winter)
+const TZ_OFFSET      = parseInt(process.env.TZ_OFFSET ?? '2');
+const MORNING_HOUR   = 7; // local hour to ask the morning question
+const COLLECT_HOURS  = 2; // how long to collect replies after the morning question
 
-if (!TELEGRAM_TOKEN || !HF_TOKEN) {
-  console.error('❌ Faltan variables de entorno: TELEGRAM_BOT_TOKEN y/o HF_API_TOKEN');
+if (!TELEGRAM_TOKEN || !GROQ_API_KEY) {
+  console.error('❌ Faltan variables de entorno: TELEGRAM_BOT_TOKEN y/o GROQ_API_KEY');
   process.exit(1);
 }
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot  = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const groq = new Groq({ apiKey: GROQ_API_KEY });
 
-// ── Rate-limit tracking ─────────────────────────────────────────────────────
-// Guardamos cuándo se nos denegó por rate-limit para no machacar la API
-let rateLimitedUntil = 0;          // timestamp ms
-let activeRequests = 0;
-const MAX_CONCURRENT = 1;          // HF free tier: 1 a la vez como mucho
-const COOLDOWN_DEFAULT_MS = 60_000;
+// ── DB ────────────────────────────────────────────────────────────────────────
+// Structure:
+// {
+//   activeChats: { "chatId": { lastMorningQuestion: "YYYY-MM-DD", collectingUntil: ms } }
+//   users:       { "userId": { name, username, bio, dreams: [{ date, text, tags, interpretation }] } }
+// }
+let db = { activeChats: {}, users: {} };
 
-function isRateLimited() {
-  return Date.now() < rateLimitedUntil;
+async function loadDb() {
+  try {
+    if (!existsSync(DATA_DIR)) await mkdir(DATA_DIR, { recursive: true });
+    if (existsSync(DATA_FILE)) {
+      db = JSON.parse(await readFile(DATA_FILE, 'utf-8'));
+    }
+  } catch (e) {
+    console.error('Error loading db:', e.message);
+  }
 }
 
-function formatWait() {
-  const secs = Math.ceil((rateLimitedUntil - Date.now()) / 1000);
-  if (secs <= 60) return `${secs}s`;
-  return `${Math.ceil(secs / 60)} min`;
+async function saveDb() {
+  await writeFile(DATA_FILE, JSON.stringify(db, null, 2));
 }
 
-// ── Gradio Space call ───────────────────────────────────────────────────────
-async function generateVideo(prompt) {
-  const client = await Client.connect(SPACE_ID, {
-    hf_token: HF_TOKEN,
-  });
-
-  console.log(`Llamando a ${SPACE_ID} /video_generation con prompt: "${prompt.slice(0, 80)}..."`);
-
-  const result = await client.predict('/video_generation', {
-    prompt: prompt,
-  });
-
-  const data = result.data;
-  console.log('Resultado del Space:', JSON.stringify(data).slice(0, 500));
-
-  // The response is a FileData object with a url field
-  let videoUrl = null;
-  const item = Array.isArray(data) ? data[0] : data;
-
-  if (item?.url) {
-    videoUrl = item.url;
-  } else if (item?.value?.url) {
-    videoUrl = item.value.url;
-  } else if (typeof item === 'string' && item.startsWith('http')) {
-    videoUrl = item;
-  }
-
-  if (!videoUrl) {
-    throw new Error(`Formato de respuesta inesperado: ${JSON.stringify(data).slice(0, 300)}`);
-  }
-
-  const response = await fetch(videoUrl);
-  if (!response.ok) {
-    throw new Error(`Error descargando vídeo: ${response.status}`);
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+// ── Time helpers ──────────────────────────────────────────────────────────────
+function localNow() {
+  const now = new Date();
+  // Shift by TZ_OFFSET to get local time
+  return new Date(now.getTime() + TZ_OFFSET * 3600 * 1000);
 }
 
-// ── /start ──────────────────────────────────────────────────────────────────
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    '🌙 *Somnia* — generador de vídeos con IA\n\n' +
-    'Envíame una descripción y crearé un vídeo corto para ti.\n\n' +
-    '• `/video <descripción>` — genera un vídeo\n' +
-    '• `/status` — estado del servicio\n' +
-    '• `/help` — ayuda\n\n' +
-    '_Uso gratuito gracias a Hugging Face Spaces. La generación puede tardar 2-5 minutos._',
-    { parse_mode: 'Markdown' }
-  );
-});
+function today() {
+  return localNow().toISOString().slice(0, 10);
+}
 
-// ── /help ───────────────────────────────────────────────────────────────────
-bot.onText(/\/help/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    '🎬 *Cómo usar Somnia*\n\n' +
-    '1\\. Escribe `/video` seguido de lo que quieres ver:\n' +
-    '   `/video un gato astronauta flotando en el espacio`\n\n' +
-    '2\\. Espera \\~2\\-5 minutos \\(GPU compartida\\)\\.\n\n' +
-    '3\\. Recibirás el vídeo directamente aquí\\.\n\n' +
-    '⚠️ *Límites:*\n' +
-    '• La GPU es compartida\\. Si hay mucha cola, hay que esperar\\.\n' +
-    '• Solo un vídeo a la vez\\.\n' +
-    '• Descripciones en inglés dan mejores resultados\\.',
-    { parse_mode: 'MarkdownV2' }
-  );
-});
+function localHour() {
+  return localNow().getUTCHours();
+}
 
-// ── /status ─────────────────────────────────────────────────────────────────
-bot.onText(/\/status/, (msg) => {
-  const parts = [];
-  parts.push(`🤖 Space: \`${SPACE_ID}\``);
-  parts.push(`📊 Peticiones activas: ${activeRequests}/${MAX_CONCURRENT}`);
-  if (isRateLimited()) {
-    parts.push(`⏳ Rate-limited — disponible en ~${formatWait()}`);
+// ── User helpers ──────────────────────────────────────────────────────────────
+function getUser(userId, name, username) {
+  const key = String(userId);
+  if (!db.users[key]) {
+    db.users[key] = { userId, name: name || 'Desconocido', username: username || '', bio: '', dreams: [] };
   } else {
-    parts.push('✅ Disponible');
+    if (name)     db.users[key].name     = name;
+    if (username) db.users[key].username = username;
   }
-  bot.sendMessage(msg.chat.id, parts.join('\n'), { parse_mode: 'Markdown' });
-});
+  return db.users[key];
+}
 
-// ── /video <prompt> ─────────────────────────────────────────────────────────
-bot.onText(/\/video(?:@\w+)?\s+(.+)/s, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const prompt = match[1].trim();
+// ── Morning question ──────────────────────────────────────────────────────────
+function isCollecting(chatId) {
+  const chat = db.activeChats[String(chatId)];
+  return chat && chat.collectingUntil && Date.now() < chat.collectingUntil;
+}
 
-  if (!prompt) {
-    return bot.sendMessage(chatId, '✏️ Escribe una descripción después de /video');
-  }
+async function sendMorningQuestion(chatId) {
+  const key = String(chatId);
+  db.activeChats[key].lastMorningQuestion = today();
+  db.activeChats[key].collectingUntil     = Date.now() + COLLECT_HOURS * 3600 * 1000;
+  await saveDb();
 
-  // ── Rate-limit check ──
-  if (isRateLimited()) {
-    return bot.sendMessage(chatId,
-      `⏳ El servicio gratuito está en pausa por cuota.\n` +
-      `Disponible en ~${formatWait()}.\n\n` +
-      `_Hay que respetar los límites para mantener el servicio gratis._`,
-      { parse_mode: 'Markdown' }
-    );
-  }
-
-  // ── Concurrency check ──
-  if (activeRequests >= MAX_CONCURRENT) {
-    return bot.sendMessage(chatId,
-      '⏳ Ya hay un vídeo generándose. Espera a que termine e inténtalo de nuevo.'
-    );
-  }
-
-  activeRequests++;
-  const statusMsg = await bot.sendMessage(chatId,
-    `🎬 Generando vídeo…\n\n_"${prompt}"_\n\nEsto puede tardar 2-5 minutos (GPU compartida).`,
+  await bot.sendMessage(chatId,
+    '🌙 *¡Buenos días!* ☀️\n\n' +
+    '¿Qué tal dormisteis? ¿Qué habéis soñado esta noche?\n\n' +
+    '_Contadme vuestros sueños y os los interpreta Somnia_ 🔮\n' +
+    `_(Tenéis ${COLLECT_HOURS}h para contarme. También podéis usar /soñe en cualquier momento)_`,
     { parse_mode: 'Markdown' }
   );
+}
 
-  const tmpFile = join(DATA_DIR, `video_${chatId}_${Date.now()}.mp4`);
+async function checkMorningTrigger() {
+  const t    = today();
+  const hour = localHour();
+
+  for (const [chatId, chat] of Object.entries(db.activeChats)) {
+    if (chat.lastMorningQuestion === t) continue; // already asked today
+    if (hour < MORNING_HOUR) continue;            // too early
+    await sendMorningQuestion(chatId);
+  }
+}
+
+// ── Groq interpretation ───────────────────────────────────────────────────────
+async function interpretDream(user, dreamText) {
+  const recentDreams = (user.dreams || []).slice(-10).map(d =>
+    `- [${d.date}] "${d.text}" (temas: ${(d.tags || []).join(', ') || 'sin clasificar'})`
+  ).join('\n');
+
+  const userContext = [
+    `Nombre: ${user.name}`,
+    user.bio            ? `Contexto personal: ${user.bio}` : '',
+    recentDreams        ? `Historial de sueños recientes:\n${recentDreams}` : '',
+  ].filter(Boolean).join('\n');
+
+  const completion = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Eres Somnia, intérprete experta en sueños. Combinas psicología jungiana, ' +
+          'simbolismo onírico y análisis narrativo. Interpretas de forma profunda y personalizada, ' +
+          'teniendo en cuenta la personalidad y el historial de la persona. ' +
+          'Si detectas patrones recurrentes, los mencionas. ' +
+          'Responde siempre en español, tono cálido pero analítico. Máximo 220 palabras.\n\n' +
+          'Formato obligatorio (sin cambiar las etiquetas):\n' +
+          '[Tu interpretación aquí]\n\n' +
+          '🏷️ Etiquetas: tag1, tag2, tag3',
+      },
+      {
+        role: 'user',
+        content: `Contexto de la persona:\n${userContext}\n\nSueño de hoy:\n"${dreamText}"`,
+      },
+    ],
+    max_tokens: 450,
+    temperature: 0.75,
+  });
+
+  const content = completion.choices[0]?.message?.content || 'No pude interpretar el sueño.';
+
+  // Extract tags
+  const tagsLine = content.match(/🏷️\s*Etiquetas?:?\s*([^\n]+)/i);
+  const tags     = tagsLine
+    ? tagsLine[1].split(/[,，]/).map(t => t.trim().replace(/[*_`]/g, '')).filter(Boolean)
+    : [];
+
+  return { interpretation: content, tags };
+}
+
+// ── Process a dream ───────────────────────────────────────────────────────────
+async function processDream(msg, dreamText) {
+  const chatId = msg.chat.id;
+  const from   = msg.from;
+  const user   = getUser(from.id, from.first_name, from.username);
+
+  const thinkingMsg = await bot.sendMessage(chatId,
+    `🔮 Interpretando el sueño de *${user.name}*…`,
+    { parse_mode: 'Markdown' }
+  );
 
   try {
-    const buffer = await generateVideo(prompt);
+    const { interpretation, tags } = await interpretDream(user, dreamText);
 
-    if (buffer.length < 1000) {
-      const text = buffer.toString('utf-8');
-      throw new Error(`Respuesta inesperada: ${text.slice(0, 200)}`);
-    }
+    user.dreams.push({ date: today(), text: dreamText, tags, interpretation });
+    await saveDb();
 
-    // Guardar temporalmente y enviar
-    await writeFile(tmpFile, buffer);
-
-    await bot.sendVideo(chatId, tmpFile, {
-      caption: `🌙 _${prompt}_`,
-      parse_mode: 'Markdown',
-      supports_streaming: true,
-    });
-
-    // Borrar mensaje de "generando…"
-    await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
-
+    await bot.editMessageText(
+      `🌙 *Sueño de ${user.name}*\n\n${interpretation}`,
+      { chat_id: chatId, message_id: thinkingMsg.message_id, parse_mode: 'Markdown' }
+    );
   } catch (err) {
-    console.error('Error generando vídeo:', err);
-
-    if (err.message?.includes('429') || err.message?.toLowerCase().includes('rate limit') || err.message?.toLowerCase().includes('quota')) {
-      const waitMs = COOLDOWN_DEFAULT_MS;
-      rateLimitedUntil = Date.now() + waitMs;
-
-      await bot.editMessageText(
-        `⚠️ *Cuota agotada*\n\n` +
-        `La GPU compartida tiene un límite por hora.\n` +
-        `Vuelve a intentarlo en ~${formatWait()}.\n\n` +
-        `_Hay que respetar estos límites para mantener que sea gratis._`,
-        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }
-      ).catch(() => {});
-
-    } else if (err.message?.includes('503') || err.message?.toLowerCase().includes('loading') || err.message?.toLowerCase().includes('queue')) {
-      await bot.editMessageText(
-        '⏳ El modelo se está cargando o hay cola.\n' +
-        'Vuelve a intentarlo en 2-3 minutos.',
-        { chat_id: chatId, message_id: statusMsg.message_id }
-      ).catch(() => {});
-
-    } else {
-      await bot.editMessageText(
-        `❌ Error generando el vídeo.\n\n\`${err.message?.slice(0, 200) || 'Error desconocido'}\``,
-        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }
-      ).catch(() => {});
-    }
-  } finally {
-    activeRequests--;
-    // Limpiar archivo temporal
-    unlink(tmpFile).catch(() => {});
+    console.error('Error interpretando:', err.message);
+    const errTxt = err.message?.toLowerCase().includes('rate') || err.status === 429
+      ? '⏳ Límite de peticiones alcanzado. Inténtalo en un minuto.'
+      : `❌ Error al interpretar. \`${err.message?.slice(0, 120)}\``;
+    await bot.editMessageText(errTxt,
+      { chat_id: chatId, message_id: thinkingMsg.message_id, parse_mode: 'Markdown' }
+    ).catch(() => {});
   }
-});
+}
 
-// ── /video sin prompt ───────────────────────────────────────────────────────
-bot.onText(/^\/video(?:@\w+)?$/, (msg) => {
+// ── /start ────────────────────────────────────────────────────────────────────
+bot.onText(/\/start/, async (msg) => {
+  const key = String(msg.chat.id);
+  if (!db.activeChats[key]) {
+    db.activeChats[key] = { lastMorningQuestion: null, collectingUntil: 0 };
+    await saveDb();
+  }
   bot.sendMessage(msg.chat.id,
-    '✏️ Añade una descripción:\n`/video un bosque mágico al amanecer`',
+    '🌙 *Somnia — Intérprete de sueños*\n\n' +
+    'Cada mañana a las 7:00 os preguntaré qué habéis soñado y lo interpretaré.\n\n' +
+    '• `/soñe <descripción>` — cuenta un sueño en cualquier momento\n' +
+    '• `/misuenos` — ver tus últimos sueños\n' +
+    '• `/sobre_mi <info>` — añade contexto sobre ti para mejor interpretación\n' +
+    '• `/perfil` — ver tu perfil y temas recurrentes\n' +
+    '• `/stats` — estadísticas del grupo',
     { parse_mode: 'Markdown' }
   );
 });
 
-// ── Arranque ────────────────────────────────────────────────────────────────
+// ── /soñe ─────────────────────────────────────────────────────────────────────
+bot.onText(/\/son[eé](?:@\w+)?\s+(.+)/si, async (msg, match) => {
+  await processDream(msg, match[1].trim());
+});
+
+bot.onText(/^\/son[eé](?:@\w+)?$/i, (msg) => {
+  bot.sendMessage(msg.chat.id,
+    '✏️ Cuéntame el sueño después del comando:\n`/soñe estaba volando sobre una ciudad…`',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ── /sobre_mi ─────────────────────────────────────────────────────────────────
+bot.onText(/\/sobre_mi\s+(.+)/si, async (msg, match) => {
+  const user = getUser(msg.from.id, msg.from.first_name, msg.from.username);
+  user.bio   = match[1].trim();
+  await saveDb();
+  bot.sendMessage(msg.chat.id,
+    `✅ Perfil actualizado, *${user.name}*. Usaré esta información para interpretarte mejor.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/^\/sobre_mi$/i, (msg) => {
+  bot.sendMessage(msg.chat.id,
+    '✏️ Añade información sobre ti:\n`/sobre_mi tengo 28 años, soy ansioso, me gusta el ajedrez`',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ── /misuenos ─────────────────────────────────────────────────────────────────
+bot.onText(/\/misuenos/, async (msg) => {
+  const user   = getUser(msg.from.id, msg.from.first_name, msg.from.username);
+  const dreams = user.dreams || [];
+
+  if (dreams.length === 0) {
+    return bot.sendMessage(msg.chat.id, `${user.name}, aún no tienes sueños registrados.`);
+  }
+
+  const lines = dreams.slice(-5).reverse().map(d =>
+    `📅 *${d.date}*\n_${d.text.slice(0, 90)}${d.text.length > 90 ? '…' : ''}_\n🏷️ ${(d.tags || []).join(', ') || '—'}`
+  ).join('\n\n');
+
+  bot.sendMessage(msg.chat.id,
+    `🌙 *Últimos sueños de ${user.name}*\n\n${lines}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ── /perfil ───────────────────────────────────────────────────────────────────
+bot.onText(/\/perfil/, async (msg) => {
+  const user   = getUser(msg.from.id, msg.from.first_name, msg.from.username);
+  const dreams = user.dreams || [];
+
+  const tagCount = {};
+  dreams.flatMap(d => d.tags || []).forEach(t => { tagCount[t] = (tagCount[t] || 0) + 1; });
+  const topTags = Object.entries(tagCount).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([t]) => t);
+
+  const text = [
+    `👤 *${user.name}*`,
+    user.bio ? `📝 ${user.bio}` : '_Sin contexto personal — usa /sobre\\_mi para añadir_',
+    `🌙 Sueños registrados: ${dreams.length}`,
+    topTags.length ? `🔁 Temas recurrentes: ${topTags.join(', ')}` : '',
+  ].filter(Boolean).join('\n');
+
+  bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
+
+// ── /stats ────────────────────────────────────────────────────────────────────
+bot.onText(/\/stats/, async (msg) => {
+  const users = Object.values(db.users).filter(u => (u.dreams || []).length > 0);
+  if (!users.length) return bot.sendMessage(msg.chat.id, 'Aún no hay sueños registrados.');
+
+  const lines = users
+    .sort((a, b) => (b.dreams?.length || 0) - (a.dreams?.length || 0))
+    .map(u => `• *${u.name}*: ${u.dreams.length} sueños`);
+
+  bot.sendMessage(msg.chat.id,
+    `📊 *Sueños registrados en el grupo*\n\n${lines.join('\n')}`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ── Collect free-text during morning window ───────────────────────────────────
+bot.on('message', async (msg) => {
+  if (!msg.text || msg.text.startsWith('/')) return;
+  if (!isCollecting(msg.chat.id)) return;
+  if (msg.text.length < 15) return; // ignore one-word replies
+  await processDream(msg, msg.text);
+});
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+await loadDb();
+await checkMorningTrigger(); // startup catch-up
+
+// Check every minute; fire morning question at MORNING_HOUR:00 local time
+setInterval(async () => {
+  const t = localNow();
+  if (t.getUTCHours() === MORNING_HOUR && t.getUTCMinutes() === 0) {
+    await checkMorningTrigger();
+  }
+}, 60_000);
+
 console.log('🌙 Somnia bot arrancado');
-console.log(`   Space: ${SPACE_ID}`);
-console.log('   Método: Gradio client (gratuito vía HF Spaces)');
+console.log(`   Pregunta matutina: ${MORNING_HOUR}:00 (TZ offset +${TZ_OFFSET}h)`);
+console.log('   Modo: intérprete de sueños con Groq');
 console.log('   Esperando mensajes…');
+
