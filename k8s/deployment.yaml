@@ -17,10 +17,27 @@ spec:
       labels:
         app: somnia-bot
     spec:
+      terminationGracePeriodSeconds: 30
       containers:
         - name: bot
           image: somnia-bot:latest
           imagePullPolicy: Never
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
           resources:
             requests:
               memory: "64Mi"
@@ -34,13 +51,15 @@ spec:
                 secretKeyRef:
                   name: somnia-bot-secret
                   key: TELEGRAM_BOT_TOKEN
-            - name: HF_API_TOKEN
+            - name: GROQ_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: somnia-bot-secret
-                  key: HF_API_TOKEN
+                  key: GROQ_API_KEY
             - name: DATA_DIR
               value: "/app/data"
+            - name: TZ_OFFSET
+              value: "2"
           volumeMounts:
             - name: data
               mountPath: /app/data

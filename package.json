@@ -1,25 +1,18 @@
 {
   "name": "somnia-bot",
-  "version": "1.0.0",
-  "description": "Bot de Telegram para generar vídeos cortos con IA (Hugging Face)",
+  "version": "2.0.0",
+  "description": "Bot de Telegram intérprete y clasificador de sueños con IA",
   "main": "src/index.js",
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js"
   },
-  "keywords": [
-    "telegram",
-    "bot",
-    "video",
-    "ai",
-    "huggingface"
-  ],
+  "keywords": ["telegram", "bot", "dreams", "ai", "groq"],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@gradio/client": "^2.1.0",
-    "@huggingface/inference": "^4.13.15",
+    "groq-sdk": "^0.9.1",
     "dotenv": "^16.4.5",
     "node-telegram-bot-api": "^0.66.0"
   }
