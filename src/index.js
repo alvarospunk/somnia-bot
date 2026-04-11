@@ -15,8 +15,24 @@ const DATA_DIR       = process.env.DATA_DIR || './data';
 const DATA_FILE      = join(DATA_DIR, 'dreams.json');
 // Timezone offset in hours (Spain: UTC+2 summer / UTC+1 winter)
 const TZ_OFFSET      = parseInt(process.env.TZ_OFFSET ?? '2');
-const MORNING_HOUR   = 7; // local hour to ask the morning question
-const COLLECT_HOURS  = 2; // how long to collect replies after the morning question
+const MORNING_HOUR   = 7;        // local hour to ask the morning question
+const COLLECT_HOURS  = 2;        // how long to collect replies after the morning question
+const ADMIN_PASSWORD = 'morfeo'; // password required for /admin commands
+
+const HELP_TEXT =
+  '🌙✨ Somnia — Guardiana de los sueños\n\n' +
+  'Cada noche el inconsciente habla. Yo lo descifro.\n\n' +
+  'Cada mañana a las 7:00 os preguntaré qué habéis soñado y lo interpretaré 🌕\n\n' +
+  '🌙 /nuevo_suenio <descripción> — relata tu sueño nocturno\n' +
+  '💤 /nueva_siesta <descripción> — relata un sueño de siesta\n' +
+  '📜 /mis_suenios — consulta tus últimos sueños\n' +
+  '📅 /mis_suenios YYYY-MM-DD — sueños de un día concreto\n' +
+  '🪬 /sobre_mi <info> — añade contexto para lecturas más profundas\n' +
+  '🔭 /perfil — explora tu perfil onírico\n' +
+  '🌌 /stats — estadísticas del grupo\n' +
+  '🌕 /suenios_grupo — inconsciente colectivo del grupo\n' +
+  '🌑 /desactivar_buenosdias — silencia el mensaje matutino\n' +
+  '🌙 /activar_buenosdias — reactiva el mensaje matutino';
 
 // ── Dream categories ──────────────────────────────────────────────────────────
 const CATEGORIES = {
@@ -49,6 +65,18 @@ const PERSONALITY_MAP = {
   '💔 Emocional':      'una persona de gran profundidad emocional. Tu mundo interior es intenso y rico en matices.',
 };
 
+// Send a message with Markdown; if Telegram rejects the markup, retry as plain text.
+function safeMd(chatId, text, extra = {}) {
+  return bot.sendMessage(chatId, text, { ...extra, parse_mode: 'Markdown' })
+    .catch(() => bot.sendMessage(chatId, text, extra));
+}
+
+// Edit a message with Markdown; if Telegram rejects the markup, retry as plain text.
+function safeEditMd(chatId, messageId, text) {
+  return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' })
+    .catch(() => bot.editMessageText(text, { chat_id: chatId, message_id: messageId }));
+}
+
 function cleanInterpretation(raw) {
   return (raw || '')
     .replace(/^\[Tu interpretación aquí\]\n?/i, '')
@@ -73,7 +101,7 @@ function classifyDreams(dreams) {
 }
 
 if (!TELEGRAM_TOKEN || !GROQ_API_KEY) {
-  console.error('❌ Faltan variables de entorno: TELEGRAM_BOT_TOKEN y/o GROQ_API_KEY');
+  console.error('❌ Missing environment variables: TELEGRAM_BOT_TOKEN and/or GROQ_API_KEY');
   process.exit(1);
 }
 
@@ -148,19 +176,44 @@ function isCollecting(chatId) {
   return chat && chat.collectingUntil && Date.now() < chat.collectingUntil;
 }
 
+// Returns true if the given userId is a member of any active group chat.
+// Used to avoid sending private morning messages to users already in a group.
+function isUserInAnyGroup(userId) {
+  return Object.entries(db.activeChats).some(([chatId, chat]) =>
+    Number(chatId) < 0 && !chat.morningDisabled && (chat.members || []).includes(Number(userId))
+  );
+}
+
+// Records a user as a member of a group chat (called whenever they interact in a group).
+function trackGroupMember(chatId, userId) {
+  if (Number(chatId) >= 0) return; // only track group chats
+  const chat = db.activeChats[String(chatId)];
+  if (!chat) return;
+  if (!chat.members) chat.members = [];
+  if (!chat.members.includes(Number(userId))) {
+    chat.members.push(Number(userId));
+  }
+}
+
 async function sendMorningQuestion(chatId) {
   const key = String(chatId);
-  db.activeChats[key].lastMorningQuestion = today();
-  db.activeChats[key].collectingUntil     = Date.now() + COLLECT_HOURS * 3600 * 1000;
-  await saveDb();
+  db.activeChats[key].collectingUntil = Date.now() + COLLECT_HOURS * 3600 * 1000;
+
+  const isGroup = Number(chatId) < 0;
+  const optOutNote = isGroup
+    ? `Tenéis ${COLLECT_HOURS}h para contarme. También podéis usar /nuevo_suenio en cualquier momento.`
+    : `Tienes ${COLLECT_HOURS}h para contarme. También puedes usar /nuevo_suenio en cualquier momento.\nUsa /desactivar_buenosdias si prefieres no recibir este mensaje en privado.`;
 
   await bot.sendMessage(chatId,
-    '🌙 *¡Buenos días!* ☀️\n\n' +
-    '¿Qué tal dormisteis? ¿Qué habéis soñado esta noche?\n\n' +
-    '_Contadme vuestros sueños y os los interpreta Somnia_ 🔮\n' +
-    `_(Tenéis ${COLLECT_HOURS}h para contarme. También podéis usar /nuevo_suenio en cualquier momento)_`,
-    { parse_mode: 'Markdown' }
+    '🌙 ¡Buenos días, viajeros del sueño! ☀️\n\n' +
+    '¿Qué tal dormisteis? ¿Qué mundos visitasteis esta noche? 🌌\n\n' +
+    'Contadme vuestros sueños y Somnia os revelará lo que el inconsciente quiso decir 🔮✨\n' +
+    optOutNote
   );
+
+  // Mark as sent only after successful delivery so a failed send can be retried on restart
+  db.activeChats[key].lastMorningQuestion = today();
+  await saveDb();
 }
 
 async function checkMorningTrigger() {
@@ -170,43 +223,53 @@ async function checkMorningTrigger() {
   for (const [chatId, chat] of Object.entries(db.activeChats)) {
     if (chat.lastMorningQuestion === t) continue; // already asked today
     if (hour < MORNING_HOUR) continue;            // too early
+    if (chat.morningDisabled) continue;           // explicitly disabled for this chat
+    // Skip private chats if the user is already a member of an active group
+    if (Number(chatId) > 0 && isUserInAnyGroup(Number(chatId))) continue;
     await sendMorningQuestion(chatId);
   }
 }
 
 // ── Groq interpretation ───────────────────────────────────────────────────────
-async function interpretDream(user, dreamText) {
+async function interpretDream(user, dreamText, isNap = false) {
   const recentDreams = (user.dreams || []).slice(-10).map(d =>
-    `- [${d.date}] "${d.text}" (temas: ${(d.tags || []).join(', ') || 'sin clasificar'})`
+    `- [${d.date}${d.isNap ? ' (siesta)' : ''}] "${d.text}" (temas: ${(d.tags || []).join(', ') || 'sin clasificar'})`
   ).join('\n');
 
   const userContext = [
     `Nombre: ${user.name}`,
-    user.bio            ? `Contexto personal: ${user.bio}` : '',
-    recentDreams        ? `Historial de sueños recientes:\n${recentDreams}` : '',
+    user.bio       ? `Contexto personal: ${user.bio}` : '',
+    recentDreams   ? `Historial de sueños recientes:\n${recentDreams}` : '',
   ].filter(Boolean).join('\n');
+
+  // Nap dreams occur in light/early-REM sleep — shorter, more literal, less archetypal
+  const systemPrompt = isNap
+    ? 'Eres Somnia, intérprete experta en sueños. Este sueño fue durante una siesta, ' +
+      'por lo que suele ser más corto, fragmentado y literal, ocurriendo en sueño ligero (NREM) ' +
+      'o REM temprano. Centra el análisis en el estado emocional inmediato y preocupaciones recientes. ' +
+      'Evita arquetipos profundos. Tono cálido y ligero. Máximo 150 palabras.\n\n' +
+      'Formato obligatorio (sin cambiar las etiquetas):\n' +
+      '[Tu interpretación aquí]\n\n' +
+      '🏷️ Etiquetas: tag1, tag2, tag3'
+    : 'Eres Somnia, intérprete experta en sueños. Combinas psicología jungiana, ' +
+      'simbolismo onírico y análisis narrativo. Interpretas de forma profunda y personalizada, ' +
+      'teniendo en cuenta la personalidad y el historial de la persona. ' +
+      'Si detectas patrones recurrentes, los mencionas. ' +
+      'Responde siempre en español, tono cálido pero analítico. Máximo 220 palabras.\n\n' +
+      'Formato obligatorio (sin cambiar las etiquetas):\n' +
+      '[Tu interpretación aquí]\n\n' +
+      '🏷️ Etiquetas: tag1, tag2, tag3';
 
   const completion = await groq.chat.completions.create({
     model: 'llama-3.3-70b-versatile',
     messages: [
-      {
-        role: 'system',
-        content:
-          'Eres Somnia, intérprete experta en sueños. Combinas psicología jungiana, ' +
-          'simbolismo onírico y análisis narrativo. Interpretas de forma profunda y personalizada, ' +
-          'teniendo en cuenta la personalidad y el historial de la persona. ' +
-          'Si detectas patrones recurrentes, los mencionas. ' +
-          'Responde siempre en español, tono cálido pero analítico. Máximo 220 palabras.\n\n' +
-          'Formato obligatorio (sin cambiar las etiquetas):\n' +
-          '[Tu interpretación aquí]\n\n' +
-          '🏷️ Etiquetas: tag1, tag2, tag3',
-      },
+      { role: 'system', content: systemPrompt },
       {
         role: 'user',
-        content: `Contexto de la persona:\n${userContext}\n\nSueño de hoy:\n"${dreamText}"`,
+        content: `Contexto de la persona:\n${userContext}\n\n${isNap ? 'Sueño de siesta' : 'Sueño de esta noche'}:\n"${dreamText}"`,
       },
     ],
-    max_tokens: 450,
+    max_tokens: isNap ? 300 : 450,
     temperature: 0.75,
   });
 
@@ -222,33 +285,51 @@ async function interpretDream(user, dreamText) {
 }
 
 // ── Process a dream ───────────────────────────────────────────────────────────
-async function processDream(msg, dreamText) {
+async function processDream(msg, dreamText, isNap = false) {
   const chatId = msg.chat.id;
   const from   = msg.from;
   const user   = getUser(from.id, from.first_name, from.username);
 
+  // Track group membership so the morning question is not sent privately to users already in a group
+  trackGroupMember(chatId, from.id);
+
+  // Prevent recording a second night dream on the same day — suggest /nueva_siesta instead
+  if (!isNap && (user.dreams || []).some(d => d.date === today() && !d.isNap)) {
+    return bot.sendMessage(chatId,
+      `🌙 ${user.name}, ya has registrado tu sueño nocturno de hoy. ¿Querías añadir una siesta? Usa /nueva_siesta 💤✨`
+    );
+  }
+
   const thinkingMsg = await bot.sendMessage(chatId,
-    `🔮 Interpretando el sueño de *${user.name}*…`,
-    { parse_mode: 'Markdown' }
+    `🌒✨ ${isNap ? `Leyendo los ecos de tu siesta, ${user.name}…` : `Adentrándome en tu sueño, ${user.name}…`}`
   );
 
   try {
-    const { interpretation, tags } = await interpretDream(user, dreamText);
+    const { interpretation, tags } = await interpretDream(user, dreamText, isNap);
 
-    user.dreams.push({ date: today(), text: dreamText, tags, interpretation });
+    user.dreams.push({ date: today(), text: dreamText, tags, interpretation, ...(isNap && { isNap: true }) });
     await saveDb();
 
-    await bot.editMessageText(
-      `🌙 *Sueño de ${user.name}*\n\n${interpretation}`,
-      { chat_id: chatId, message_id: thinkingMsg.message_id, parse_mode: 'Markdown' }
-    );
+    // Classify this dream immediately so the category is shown right after registration
+    const dreamCounts  = classifyDreams([{ tags }]);
+    const topCategory  = Object.entries(dreamCounts).sort((a, b) => b[1] - a[1])[0];
+    const categoryLine = topCategory
+      ? `\n\n🗂️ *Categoría:* ${topCategory[0]}`
+      : '';
+
+    const header = isNap ? `💤 Siesta de ${user.name}` : `🌙 Sueño de ${user.name}`;
+
+    const replyText = `${header}\n\n${interpretation}${categoryLine}`;
+
+    // Try with Markdown first; if it fails (e.g. unmatched underscores from Groq) fall back to plain text
+    await safeEditMd(chatId, thinkingMsg.message_id, replyText);
   } catch (err) {
-    console.error('Error interpretando:', err.message);
+    console.error('Error interpreting dream:', err.message);
     const errTxt = err.message?.toLowerCase().includes('rate') || err.status === 429
-      ? '⏳ Límite de peticiones alcanzado. Inténtalo en un minuto.'
-      : `❌ Error al interpretar. \`${err.message?.slice(0, 120)}\``;
+      ? '🌫️ Los astros están saturados… inténtalo en un minuto.'
+      : `❌ Error al interpretar: ${err.message?.slice(0, 120)}`;
     await bot.editMessageText(errTxt,
-      { chat_id: chatId, message_id: thinkingMsg.message_id, parse_mode: 'Markdown' }
+      { chat_id: chatId, message_id: thinkingMsg.message_id }
     ).catch(() => {});
   }
 }
@@ -260,16 +341,12 @@ bot.onText(/\/start/, async (msg) => {
     db.activeChats[key] = { lastMorningQuestion: null, collectingUntil: 0 };
     await saveDb();
   }
-  bot.sendMessage(msg.chat.id,
-    '🌙 *Somnia — Intérprete de sueños*\n\n' +
-    'Cada mañana a las 7:00 os preguntaré qué habéis soñado y lo interpretaré.\n\n' +
-    '• `/nuevo_suenio <descripción>` — cuenta un sueño en cualquier momento\n' +
-    '• `/mis_suenios` — ver tus últimos sueños\n' +
-    '• `/sobre_mi <info>` — añade contexto sobre ti para mejor interpretación\n' +
-    '• `/perfil` — ver tu perfil y temas recurrentes\n' +
-    '• `/stats` — estadísticas del grupo',
-    { parse_mode: 'Markdown' }
-  );
+  bot.sendMessage(msg.chat.id, HELP_TEXT);
+});
+
+// ── /help ────────────────────────────────────────────────────────────────────
+bot.onText(/\/help(?:@\w+)?/, (msg) => {
+  bot.sendMessage(msg.chat.id, HELP_TEXT);
 });
 
 // ── /nuevo_suenio ────────────────────────────────────────────────────────────
@@ -278,9 +355,19 @@ bot.onText(/\/nuevo_suenio(?:@\w+)?\s+(.+)/si, async (msg, match) => {
 });
 
 bot.onText(/^\/nuevo_suenio(?:@\w+)?$/i, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    '✏️ Cuéntame el sueño después del comando:\n`/nuevo_suenio estaba volando sobre una ciudad…`',
-    { parse_mode: 'Markdown' }
+  safeMd(msg.chat.id,
+    '🌙 Cuéntame lo que viste en sueños después del comando:\n`/nuevo_suenio estaba volando sobre una ciudad…`'
+  );
+});
+
+// ── /nueva_siesta ────────────────────────────────────────────────────────────
+bot.onText(/\/nueva_siesta(?:@\w+)?\s+(.+)/si, async (msg, match) => {
+  await processDream(msg, match[1].trim(), true);
+});
+
+bot.onText(/^\/nueva_siesta(?:@\w+)?$/i, (msg) => {
+  safeMd(msg.chat.id,
+    '💤🌫️ Cuéntame los fragmentos de tu siesta después del comando:\n`/nueva_siesta soñé con el trabajo un momento`'
   );
 });
 
@@ -289,37 +376,37 @@ bot.onText(/\/sobre_mi\s+(.+)/si, async (msg, match) => {
   const user = getUser(msg.from.id, msg.from.first_name, msg.from.username);
   user.bio   = match[1].trim();
   await saveDb();
-  bot.sendMessage(msg.chat.id,
-    `✅ Perfil actualizado, *${user.name}*. Usaré esta información para interpretarte mejor.`,
-    { parse_mode: 'Markdown' }
+  safeMd(msg.chat.id,
+    `🪬✨ Guardado, *${user.name}*. Los astros toman nota — tus próximas lecturas serán más certeras.`
   );
 });
 
 bot.onText(/^\/sobre_mi$/i, (msg) => {
-  bot.sendMessage(msg.chat.id,
-    '✏️ Añade información sobre ti:\n`/sobre_mi tengo 28 años, soy ansioso, me gusta el ajedrez`',
-    { parse_mode: 'Markdown' }
+  safeMd(msg.chat.id,
+    '🪬 Comparte algo sobre ti para que Somnia te conozca mejor:\n`/sobre_mi tengo 28 años, soy ansioso, me gusta el ajedrez`'
   );
 });
 
 // ── /mis_suenios ────────────────────────────────────────────────────────────
 bot.onText(/\/mis_suenios(?:@\w+)?\s+(\d{4}-\d{2}-\d{2})/, (msg, match) => {
-  const user  = getUser(msg.from.id, msg.from.first_name, msg.from.username);
-  const date  = match[1];
-  const dream = (user.dreams || []).find(d => d.date === date);
+  const user   = getUser(msg.from.id, msg.from.first_name, msg.from.username);
+  const date   = match[1];
+  const onDay  = (user.dreams || []).filter(d => d.date === date);
 
-  if (!dream) {
-    return bot.sendMessage(msg.chat.id, `No encuentro ningún sueño tuyo del ${date}.`);
+  if (!onDay.length) {
+    return bot.sendMessage(msg.chat.id, `🌑 El registro onírico del ${date} está en blanco… ese día guardaste bien tus secretos.`);
   }
 
-  const text = [
-    `📅 *${dream.date}*`,
-    `\n💭 *Sueño:*\n${dream.text}`,
-    dream.interpretation ? `\n🔮 *Análisis:*\n${dream.interpretation}` : '',
-    dream.tags?.length ? `\n🏷️ *Etiquetas:* ${dream.tags.join(', ')}` : '',
-  ].filter(Boolean).join('\n');
+  const sections = onDay.map(dream => [
+    dream.isNap ? '💤 *Siesta*' : '🌙 *Sueño nocturno*',
+    `💭 ${dream.text}`,
+    dream.interpretation ? `🔮 *Análisis:*\n${dream.interpretation}` : '',
+    dream.tags?.length ? `🏷️ *Etiquetas:* ${dream.tags.join(', ')}` : '',
+  ].filter(Boolean).join('\n')).join('\n\n─────────────\n\n');
 
-  bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+  safeMd(msg.chat.id,
+    `📅 *${date}*\n\n${sections}`
+  );
 });
 
 bot.onText(/\/mis_suenios(?:@\w+)?(?:\s*$)/, async (msg) => {
@@ -327,13 +414,32 @@ bot.onText(/\/mis_suenios(?:@\w+)?(?:\s*$)/, async (msg) => {
   const dreams = user.dreams || [];
 
   if (dreams.length === 0) {
-    return bot.sendMessage(msg.chat.id, `${user.name}, aún no tienes sueños registrados.`);
+    return safeMd(msg.chat.id, `🌑 *${user.name}*, aún no has compartido ningún sueño conmigo… el libro onírico está en blanco.`);
   }
 
-  // ── Dream list (last 5) ──
-  const lines = dreams.slice(-5).reverse().map(d =>
-    `📅 *${d.date}*\n${d.text.slice(0, 90)}${d.text.length > 90 ? '…' : ''}\n🏷️ ${(d.tags || []).join(', ') || '—'}`
-  ).join('\n\n');
+  // ── Dream list: last 5 entries, grouping same-day night+nap together ──
+  // Deduplicate by date so a day with both types appears as one block
+  const seenDates  = new Set();
+  const lastBlocks = [];
+  for (const d of [...dreams].reverse()) {
+    if (seenDates.has(d.date)) continue; // already rendered this date
+    seenDates.add(d.date);
+    lastBlocks.push(d.date);
+    if (lastBlocks.length === 5) break;
+  }
+
+  const lines = lastBlocks.map(date => {
+    const onDay = dreams.filter(d => d.date === date);
+    const hasNap   = onDay.some(d => d.isNap);
+    const hasNight = onDay.some(d => !d.isNap);
+    // Date header badge when both types exist
+    const badge = (hasNight && hasNap) ? ' 🌙💤' : hasNap ? ' 💤' : '';
+    const entries = onDay.map(d => {
+      const label = (hasNight && hasNap) ? (d.isNap ? '_Siesta_ ' : '_Noche_ ') : '';
+      return `${label}${d.text.slice(0, 80)}${d.text.length > 80 ? '…' : ''}\n🏷️ ${(d.tags || []).join(', ') || '—'}`;
+    }).join('\n');
+    return `📅 *${date}*${badge}\n${entries}`;
+  }).join('\n\n');
 
   // ── Category chart ──
   const counts = classifyDreams(dreams);
@@ -359,10 +465,9 @@ bot.onText(/\/mis_suenios(?:@\w+)?(?:\s*$)/, async (msg) => {
       `Composición: ${top2text}`;
   }
 
-  bot.sendMessage(msg.chat.id,
-    `🌙 *Últimos sueños de ${user.name}*\n\n${lines}${chartSection}\n\n` +
-    'Para ver el detalle de uno: `/mis_suenios 2026-04-09`',
-    { parse_mode: 'Markdown' }
+  safeMd(msg.chat.id,
+    `🌙✨ *El diario onírico de ${user.name}*\n\n${lines}${chartSection}\n\n` +
+    '🔍 Para ver el detalle de un día concreto: `/mis_suenios 2026-04-09`'
   );
 });
 
@@ -377,39 +482,38 @@ bot.onText(/\/perfil/, async (msg) => {
 
   const text = [
     `👤 *${user.name}*`,
-    user.bio ? `📝 ${user.bio}` : '_Sin contexto personal — usa /sobre\\_mi para añadir_',
+    user.bio ? `📜 _"${user.bio}"_` : '_Sin contexto personal — usa /sobre\_mi para que los astros te conozcan mejor_ 🪬',
     `🌙 Sueños registrados: ${dreams.length}`,
-    topTags.length ? `🔁 Temas recurrentes: ${topTags.join(', ')}` : '',
+    topTags.length ? `🔁 *Temas recurrentes:* ${topTags.join(' · ')}` : '🌑 _Aún sin patrones detectados…_',
   ].filter(Boolean).join('\n');
 
-  bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+  safeMd(msg.chat.id, text);
 });
 
 // ── /stats ────────────────────────────────────────────────────────────────────
 bot.onText(/\/stats/, async (msg) => {
   const users = Object.values(db.users).filter(u => (u.dreams || []).length > 0);
-  if (!users.length) return bot.sendMessage(msg.chat.id, 'Aún no hay sueños registrados.');
+  if (!users.length) return bot.sendMessage(msg.chat.id, '🌑 El grupo aún no ha compartido sueños con Somnia…');
 
   const lines = users
     .sort((a, b) => (b.dreams?.length || 0) - (a.dreams?.length || 0))
-    .map(u => `• *${u.name}*: ${u.dreams.length} sueños`);
+    .map(u => `🌙 *${u.name}*: ${u.dreams.length} sueño${u.dreams.length === 1 ? '' : 's'}`);
 
-  bot.sendMessage(msg.chat.id,
-    `📊 *Sueños registrados en el grupo*\n\n${lines.join('\n')}`,
-    { parse_mode: 'Markdown' }
+  safeMd(msg.chat.id,
+    `🌌 *Archivo onírico del grupo*\n\n${lines.join('\n')}`
   );
 });
 // ── /suenios_grupo ─────────────────────────────────────────────────────────
 bot.onText(/\/suenios_grupo/, async (msg) => {
   const users = Object.values(db.users).filter(u => (u.dreams || []).length > 0);
-  if (!users.length) return bot.sendMessage(msg.chat.id, 'Aún no hay sueños registrados en el grupo.');
+  if (!users.length) return bot.sendMessage(msg.chat.id, '🌑 El inconsciente colectivo aún está en silencio…');
 
   const allDreams = users.flatMap(u => u.dreams || []);
   const counts    = classifyDreams(allDreams);
   const total     = Object.values(counts).reduce((a, b) => a + b, 0);
 
   if (total === 0) {
-    return bot.sendMessage(msg.chat.id, 'Aún no hay suficientes categorías para analizar el grupo.');
+    return bot.sendMessage(msg.chat.id, '🌫️ Aún no hay suficientes sueños categorizados para leer el inconsciente del grupo…');
   }
 
   // Per-user summary
@@ -436,23 +540,124 @@ bot.onText(/\/suenios_grupo/, async (msg) => {
   const top3text = sorted.slice(0, 3).map(([c, n]) => `${Math.round((n / total) * 100)}% ${c}`).join(' · ');
   const groupPersonality = PERSONALITY_MAP[topCat] || 'una personalidad colectiva compleja y multifacética.';
 
-  bot.sendMessage(msg.chat.id,
-    `🌙 *El inconsciente colectivo del grupo*\n\n` +
+  safeMd(msg.chat.id,
+    `�✨ *El inconsciente colectivo del grupo*\n_Lo que los sueños de todos revelan juntos…_\n\n` +
     `${userLines}\n\n` +
     `*Categorías oníricas del grupo:*\n` +
     `${chartLines}\n\n` +
     `*Personalidad colectiva:*\n` +
     `Juntos, los sueños del grupo revelan ${groupPersonality}\n` +
-    `Composición: ${top3text}`,
-    { parse_mode: 'Markdown' }
+    `Composición: ${top3text}`
   );
 });
+// ── /admin ───────────────────────────────────────────────────────────────────
+// Usage: /admin <password>
+bot.onText(/\/admin(?:@\w+)?\s+(\S+)$/, async (msg, match) => {
+  if (match[1] !== ADMIN_PASSWORD) {
+    return bot.sendMessage(msg.chat.id, '❌ Wrong password.');
+  }
+  const users = Object.values(db.users);
+  if (!users.length) return bot.sendMessage(msg.chat.id, 'No users registered yet.');
+
+  const lines = users
+    .sort((a, b) => (b.dreams?.length || 0) - (a.dreams?.length || 0))
+    .map(u => `• *${u.name}* (id: \`${u.userId}\`) — ${u.dreams?.length || 0} dreams`);
+
+  safeMd(msg.chat.id,
+    `🔐 *Admin Panel*\n\n${lines.join('\n')}\n\n` +
+    '*Subcommands:*\n' +
+    '• `/admin\_user <password> <userId>` — list all dreams for a user\n' +
+    '• `/admin\_del <password> <userId> <index>` — delete dream by index (1-based)'
+  );
+});
+
+bot.onText(/^\/admin(?:@\w+)?$/i, (msg) => {
+  safeMd(msg.chat.id, '🔐 Usage: `/admin <password>`');
+});
+
+// ── /admin_user ───────────────────────────────────────────────────────────────
+// Usage: /admin_user <password> <userId>
+bot.onText(/\/admin_user(?:@\w+)?\s+(\S+)\s+(\S+)/, async (msg, match) => {
+  if (match[1] !== ADMIN_PASSWORD) return bot.sendMessage(msg.chat.id, '❌ Wrong password.');
+  const userId = match[2];
+  const user   = db.users[userId];
+  if (!user) return safeMd(msg.chat.id, `User \`${userId}\` not found.`);
+
+  const dreams = user.dreams || [];
+  if (!dreams.length) return bot.sendMessage(msg.chat.id, `${user.name} has no dreams yet.`);
+
+  const lines = dreams.map((d, i) =>
+    `*${i + 1}.* [${d.date}${d.isNap ? ' 💤' : ''}] ${d.text.slice(0, 80)}${d.text.length > 80 ? '…' : ''}`
+  ).join('\n');
+
+  safeMd(msg.chat.id,
+    `🌙 *Dreams of ${user.name}* (${dreams.length} total)\n\n${lines}`
+  );
+});
+
+// ── /admin_del ────────────────────────────────────────────────────────────────
+// Usage: /admin_del <password> <userId> <index>
+bot.onText(/\/admin_del(?:@\w+)?\s+(\S+)\s+(\S+)\s+(\d+)/, async (msg, match) => {
+  if (match[1] !== ADMIN_PASSWORD) return bot.sendMessage(msg.chat.id, '❌ Wrong password.');
+  const userId = match[2];
+  const index  = parseInt(match[3]) - 1; // convert 1-based to 0-based
+  const user   = db.users[userId];
+  if (!user) return safeMd(msg.chat.id, `User \`${userId}\` not found.`);
+
+  const dreams = user.dreams || [];
+  if (index < 0 || index >= dreams.length) {
+    return bot.sendMessage(msg.chat.id, `Invalid index. ${user.name} has ${dreams.length} dream(s).`);
+  }
+
+  const [removed] = dreams.splice(index, 1);
+  await saveDb();
+  safeMd(msg.chat.id,
+    `✅ Deleted dream #${index + 1} of *${user.name}* (${removed.date}${removed.isNap ? ' 💤' : ''}).`
+  );
+});
+
 // ── Collect free-text during morning window ───────────────────────────────────
 bot.on('message', async (msg) => {
   if (!msg.text || msg.text.startsWith('/')) return;
-  if (!isCollecting(msg.chat.id)) return;
-  if (msg.text.length < 15) return; // ignore one-word replies
-  await processDream(msg, msg.text);
+  // Track group membership so we know not to ping this user privately
+  if (msg.chat.id < 0) trackGroupMember(msg.chat.id, msg.from.id);
+  if (isCollecting(msg.chat.id)) {
+    // In groups, ignore very short replies (greetings, reactions, etc.)
+    if (msg.chat.type !== 'private' && msg.text.length < 15) return;
+    return processDream(msg, msg.text);
+  }
+  // In private chats outside the collecting window, reply with the help menu
+  if (msg.chat.type === 'private') {
+    bot.sendMessage(msg.chat.id, HELP_TEXT);
+  }
+});
+
+// ── /desactivar_buenosdias ───────────────────────────────────────────────────
+bot.onText(/\/desactivar_buenosdias(?:@\w+)?/, async (msg) => {
+  const key = String(msg.chat.id);
+  if (!db.activeChats[key]) {
+    return bot.sendMessage(msg.chat.id, '🌑 Este chat no está registrado en Somnia. Usa /start primero.');
+  }
+  db.activeChats[key].morningDisabled = true;
+  await saveDb();
+  const scope = msg.chat.type === 'private' ? 'esta conversación privada' : 'este grupo';
+  safeMd(msg.chat.id,
+    `🌑 *El ritual del amanecer ha sido suspendido para ${scope}.* Somnia guardará silencio por las mañanas aquí. Usa /activar\_buenosdias para retomarlo.`
+  );
+});
+
+// ── /activar_buenosdias ──────────────────────────────────────────────────────
+bot.onText(/\/activar_buenosdias(?:@\w+)?/, async (msg) => {
+  const key = String(msg.chat.id);
+  if (!db.activeChats[key]) {
+    return bot.sendMessage(msg.chat.id, '🌑 Este chat no está registrado. Usa /start primero.');
+  }
+  db.activeChats[key].morningDisabled = false;
+  await saveDb();
+  const scope = msg.chat.type === 'private' ? 'esta conversación privada' : 'este grupo';
+  safeMd(msg.chat.id,
+    `🌙✨ *El ritual del amanecer vuelve a despertar para ${scope}.* Mañana a las 7:00, Somnia volverá a preguntar por vuestros sueños.`
+  );
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
@@ -485,8 +690,14 @@ process.on('SIGTERM', () => {
   bot.stopPolling().finally(() => process.exit(0));
 });
 
-console.log('🌙 Somnia bot arrancado');
-console.log(`   Pregunta matutina: ${MORNING_HOUR}:00 (TZ offset +${TZ_OFFSET}h)`);
-console.log('   Modo: intérprete de sueños con Groq');
-console.log('   Esperando mensajes…');
+// Prevent unhandled promise rejections (e.g. Telegram API errors) from crashing the process
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err?.message || err);
+  if (err?.stack) console.error(err.stack.split('\n').slice(0, 6).join('\n'));
+});
+
+console.log('🌙 Somnia bot started');
+console.log(`   Morning question: ${MORNING_HOUR}:00 (TZ offset +${TZ_OFFSET}h)`);
+console.log('   Mode: dream interpreter powered by Groq');
+console.log('   Waiting for messages…');
 
