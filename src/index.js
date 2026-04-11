@@ -566,8 +566,10 @@ bot.onText(/\/admin(?:@\w+)?\s+(\S+)$/, async (msg, match) => {
   safeMd(msg.chat.id,
     `🔐 *Admin Panel*\n\n${lines.join('\n')}\n\n` +
     '*Subcommands:*\n' +
-    '• `/admin\_user <password> <userId>` — list all dreams for a user\n' +
-    '• `/admin\_del <password> <userId> <index>` — delete dream by index (1-based)'
+    '• `/admin_user <password> <userId>` — list all dreams for a user\n' +
+    '• `/admin_del <password> <userId> <index>` — delete dream by index (1-based)\n' +
+    '• `/admin_list <password>` — list all users, groups and private chats\n' +
+    '• `/admin_msg <password> <chatId> <text>` — send a custom message to any chat or user'
   );
 });
 
@@ -614,6 +616,74 @@ bot.onText(/\/admin_del(?:@\w+)?\s+(\S+)\s+(\S+)\s+(\d+)/, async (msg, match) =>
   safeMd(msg.chat.id,
     `✅ Deleted dream #${index + 1} of *${user.name}* (${removed.date}${removed.isNap ? ' 💤' : ''}).`
   );
+});
+
+// ── /admin_list ───────────────────────────────────────────────────────────────
+// Usage: /admin_list <password>
+bot.onText(/\/admin_list(?:@\w+)?\s+(\S+)$/, async (msg, match) => {
+  if (match[1] !== ADMIN_PASSWORD) return bot.sendMessage(msg.chat.id, '❌ Wrong password.');
+
+  // Users
+  const users = Object.values(db.users);
+  const userLines = users.length
+    ? users
+        .sort((a, b) => (b.dreams?.length || 0) - (a.dreams?.length || 0))
+        .map(u => `• *${u.name}* (@${u.username || '—'}) id: \`${u.userId}\` — ${u.dreams?.length || 0} dreams`)
+        .join('\n')
+    : '_No users yet._';
+
+  // Chats
+  const chatEntries = Object.entries(db.activeChats);
+  const groups  = chatEntries.filter(([id]) => Number(id) < 0);
+  const privates = chatEntries.filter(([id]) => Number(id) > 0);
+
+  const groupLines = groups.length
+    ? groups.map(([id, c]) => {
+        const memberCount = (c.members || []).length;
+        const status = c.morningDisabled ? '🌑 off' : '🌙 on';
+        return `• id: \`${id}\` — ${memberCount} member(s) — morning: ${status}`;
+      }).join('\n')
+    : '_No groups._';
+
+  const privateLines = privates.length
+    ? privates.map(([id, c]) => {
+        const u = db.users[id];
+        const label = u ? `${u.name} (@${u.username || '—'})` : `id ${id}`;
+        const status = c.morningDisabled ? '🌑 off' : '🌙 on';
+        return `• ${label} \`${id}\` — morning: ${status}`;
+      }).join('\n')
+    : '_No private chats._';
+
+  safeMd(msg.chat.id,
+    `🔐 *Admin — Registered chats*\n\n` +
+    `👥 *Groups (${groups.length}):*\n${groupLines}\n\n` +
+    `💬 *Private chats (${privates.length}):*\n${privateLines}\n\n` +
+    `👤 *Users (${users.length}):*\n${userLines}\n\n` +
+    `_Use_ \`/admin_msg ${ADMIN_PASSWORD} <chatId> <text>\` _to send a message._`
+  );
+});
+
+bot.onText(/^\/admin_list(?:@\w+)?$/i, (msg) => {
+  safeMd(msg.chat.id, '🔐 Usage: `/admin_list <password>`');
+});
+
+// ── /admin_msg ────────────────────────────────────────────────────────────────
+// Usage: /admin_msg <password> <chatId> <message text>
+bot.onText(/\/admin_msg(?:@\w+)?\s+(\S+)\s+(-?\d+)\s+(.+)/s, async (msg, match) => {
+  if (match[1] !== ADMIN_PASSWORD) return bot.sendMessage(msg.chat.id, '❌ Wrong password.');
+  const targetChatId = match[2];
+  const text = match[3].trim();
+
+  try {
+    await bot.sendMessage(targetChatId, text);
+    safeMd(msg.chat.id, `✅ Message sent to \`${targetChatId}\`.`);
+  } catch (err) {
+    safeMd(msg.chat.id, `❌ Failed: ${err.message}`);
+  }
+});
+
+bot.onText(/^\/admin_msg(?:@\w+)?$/i, (msg) => {
+  safeMd(msg.chat.id, '🔐 Usage: `/admin_msg <password> <chatId> <message>`');
 });
 
 // ── Collect free-text during morning window ───────────────────────────────────
