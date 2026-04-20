@@ -105,7 +105,7 @@ if (!TELEGRAM_TOKEN || !GROQ_API_KEY) {
   process.exit(1);
 }
 
-const bot  = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot  = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 
 // ── DB ────────────────────────────────────────────────────────────────────────
@@ -285,29 +285,37 @@ async function interpretDream(user, dreamText, isNap = false) {
 }
 
 // ── Process a dream ───────────────────────────────────────────────────────────
-async function processDream(msg, dreamText, isNap = false) {
-  const chatId = msg.chat.id;
-  const from   = msg.from;
-  const user   = getUser(from.id, from.first_name, from.username);
+// overrideDate: 'YYYY-MM-DD' — used when registering missed dreams on startup
+async function processDream(msg, dreamText, isNap = false, overrideDate = null) {
+  const chatId  = msg.chat.id;
+  const from    = msg.from;
+  const user    = getUser(from.id, from.first_name, from.username);
+  const dateStr = overrideDate || today();
+  const missed  = !!overrideDate;
 
   // Track group membership so the morning question is not sent privately to users already in a group
   trackGroupMember(chatId, from.id);
 
   // Prevent recording a second night dream on the same day — suggest /nueva_siesta instead
-  if (!isNap && (user.dreams || []).some(d => d.date === today() && !d.isNap)) {
-    return bot.sendMessage(chatId,
-      `🌙 ${user.name}, ya has registrado tu sueño nocturno de hoy. ¿Querías añadir una siesta? Usa /nueva_siesta 💤✨`
-    );
+  if (!isNap && (user.dreams || []).some(d => d.date === dateStr && !d.isNap)) {
+    if (!missed) {
+      return bot.sendMessage(chatId,
+        `🌙 ${user.name}, ya has registrado tu sueño nocturno de ese día. ¿Querías añadir una siesta? Usa /nueva_siesta 💤✨`
+      );
+    }
+    return; // already registered — silently skip during startup scan
   }
 
-  const thinkingMsg = await bot.sendMessage(chatId,
-    `🌒✨ ${isNap ? `Leyendo los ecos de tu siesta, ${user.name}…` : `Adentrándome en tu sueño, ${user.name}…`}`
-  );
+  const thinkingText = missed
+    ? `🌙 *${user.name}*, encontré un sueño tuyo del *${dateStr}* que no registré a tiempo… lo proceso ahora 🔮`
+    : `🌒✨ ${isNap ? `Leyendo los ecos de tu siesta, ${user.name}…` : `Adentrándome en tu sueño, ${user.name}…`}`;
+
+  const thinkingMsg = await safeMd(chatId, thinkingText);
 
   try {
     const { interpretation, tags } = await interpretDream(user, dreamText, isNap);
 
-    user.dreams.push({ date: today(), text: dreamText, tags, interpretation, ...(isNap && { isNap: true }) });
+    user.dreams.push({ date: dateStr, text: dreamText, tags, interpretation, ...(isNap && { isNap: true }) });
     await saveDb();
 
     // Classify this dream immediately so the category is shown right after registration
@@ -317,7 +325,9 @@ async function processDream(msg, dreamText, isNap = false) {
       ? `\n\n🗂️ *Categoría:* ${topCategory[0]}`
       : '';
 
-    const header = isNap ? `💤 Siesta de ${user.name}` : `🌙 Sueño de ${user.name}`;
+    const header = missed
+      ? (isNap ? `💤 Siesta de ${user.name} — ${dateStr}` : `🌙 Sueño de ${user.name} — ${dateStr} _(registrado tarde)_`)
+      : (isNap ? `💤 Siesta de ${user.name}` : `🌙 Sueño de ${user.name}`);
 
     const replyText = `${header}\n\n${interpretation}${categoryLine}`;
 
@@ -730,9 +740,55 @@ bot.onText(/\/activar_buenosdias(?:@\w+)?/, async (msg) => {
   );
 });
 
+// ── Startup: scan last 50 pending updates for unregistered dreams ────────────
+// Handles the case where the bot was restarted and Telegram has queued updates.
+// Uses the original message timestamp so the dream is stored on the correct date.
+async function scanMissedDreams() {
+  let lastUpdateId = 0;
+  try {
+    const updates = await bot.getUpdates({ limit: 50, timeout: 0 });
+    if (!updates.length) return;
+
+    lastUpdateId = updates[updates.length - 1].update_id;
+
+    for (const update of updates) {
+      const msg = update.message;
+      if (!msg?.text || !msg.from) continue;
+
+      const isNapCmd  = /^\/nueva_siesta(?:@\w+)?\s+(.+)/si.test(msg.text);
+      const isDreamCmd = /^\/nuevo_suenio(?:@\w+)?\s+(.+)/si.test(msg.text);
+      if (!isDreamCmd && !isNapCmd) continue;
+
+      const isNap     = isNapCmd;
+      const dreamText = msg.text.replace(/^\/nuevo_suenio(?:@\w+)?\s+|^\/nueva_siesta(?:@\w+)?\s+/si, '').trim();
+
+      // Derive local date from the Telegram message timestamp
+      const msgDateStr = new Date((msg.date + TZ_OFFSET * 3600) * 1000).toISOString().slice(0, 10);
+
+      const user = getUser(msg.from.id, msg.from.first_name, msg.from.username);
+
+      // Skip if already registered (same text + same date)
+      const alreadyRegistered = (user.dreams || []).some(d => d.text === dreamText && d.date === msgDateStr);
+      if (alreadyRegistered) continue;
+
+      console.log(`Missed dream detected for ${user.name} (${msgDateStr}) — registering…`);
+      await processDream(msg, dreamText, isNap, msgDateStr);
+    }
+  } catch (err) {
+    console.error('Error scanning missed dreams:', err.message);
+  } finally {
+    // Acknowledge all fetched updates so polling starts cleanly from the next one
+    if (lastUpdateId > 0) {
+      await bot.getUpdates({ offset: lastUpdateId + 1, limit: 1, timeout: 0 }).catch(() => {});
+    }
+  }
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 await loadDb();
+await scanMissedDreams(); // register any dreams sent while the bot was down
 await checkMorningTrigger(); // startup catch-up
+bot.startPolling();         // begin normal polling after scan is complete
 
 // Check every minute; fire morning question at MORNING_HOUR:00 local time
 setInterval(async () => {
